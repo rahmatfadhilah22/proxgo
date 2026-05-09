@@ -1,0 +1,7 @@
+.env
+token-gateway
+coverage.out
+
+/docs
+
+proxgo.md

@@ -1,0 +1,10 @@
+services:
+  proxgo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    restart: unless-stopped
