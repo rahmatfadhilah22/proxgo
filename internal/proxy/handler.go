@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +15,8 @@ import (
 	"proxgo/internal/httpjson"
 	"proxgo/internal/pool"
 )
+
+const maxRequestBodyBytes = 1 << 20
 
 type tokenPool interface {
 	PickExcluding(excluded map[string]struct{}) (string, error)
@@ -29,7 +33,7 @@ type Handler struct {
 
 func NewHandler(baseURL *url.URL, tokenPool tokenPool, cooldownDuration time.Duration) *Handler {
 	return &Handler{
-		client:           &http.Client{},
+		client:           &http.Client{Timeout: 60 * time.Second},
 		baseURL:          cloneURL(baseURL),
 		pool:             tokenPool,
 		cooldownDuration: cooldownDuration,
@@ -37,9 +41,13 @@ func NewHandler(baseURL *url.URL, tokenPool tokenPool, cooldownDuration time.Dur
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes+1))
 	if err != nil {
 		httpjson.WriteError(w, http.StatusInternalServerError, "failed to read request body")
+		return
+	}
+	if len(body) > maxRequestBodyBytes {
+		httpjson.WriteError(w, http.StatusRequestEntityTooLarge, "request body too large")
 		return
 	}
 
@@ -47,6 +55,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	usedTokens := make(map[string]struct{})
 	serverRetryUsed := false
+	transportRetryUsed := false
 
 	for len(usedTokens) < h.pool.Size() {
 		token, err := h.pool.PickExcluding(usedTokens)
@@ -60,11 +69,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		resp, duration, err := h.forward(r, body, token)
 		if err != nil {
+			if !transportRetryUsed && shouldRetryTransportError(err) {
+				retryToken, retryErr := h.pool.PickExcluding(usedTokens)
+				if retryErr == nil {
+					transportRetryUsed = true
+					usedTokens[retryToken] = struct{}{}
+
+					resp, duration, err = h.forward(r, body, retryToken)
+					token = retryToken
+					if err == nil {
+						goto handleResponse
+					}
+				}
+			}
+
 			httpjson.WriteError(w, http.StatusBadGateway, "upstream request failed")
 			log.Printf("[ERROR] %s %s -> token=%s -> upstream error: %v", r.Method, r.URL.Path, tokenLabel(token), err)
 			return
 		}
 
+	handleResponse:
 		if isServerError(resp.StatusCode) && !serverRetryUsed {
 			retryToken, retryErr := h.pool.PickExcluding(usedTokens)
 			if retryErr == nil {
@@ -190,6 +214,10 @@ func tokenLabel(token string) string {
 		return token
 	}
 	return fmt.Sprintf("%s...", token[:6])
+}
+
+func shouldRetryTransportError(err error) bool {
+	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
 var _ tokenPool = (*pool.TokenPool)(nil)

@@ -7,7 +7,8 @@
 - Validasi akses client memakai `GATEWAY_API_KEY`
 - Rotasi token upstream secara round-robin
 - Cooldown token otomatis saat kena `429`
-- Retry ke token lain saat `429` atau `5xx`
+- Retry ke token lain saat `429`, `5xx`, atau error transport sementara
+- Batas ukuran body request untuk mencegah lonjakan memory
 - Tetap model-agnostic, body request diteruskan apa adanya
 
 ## Struktur Project
@@ -84,6 +85,11 @@ docker compose up --build
 ## Endpoint Tambahan
 
 - `GET /healthz` mengembalikan `200 {"status":"ok"}` tanpa membutuhkan `Authorization` header
+
+## Batas Request
+
+- Body request dibatasi sampai `1 MiB`
+- Jika melewati batas, gateway mengembalikan `413 {"error":"request body too large"}`
 
 ## Catatan
 
