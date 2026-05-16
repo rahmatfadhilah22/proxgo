@@ -42,6 +42,9 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("invalid TOKEN_COOLDOWN_SECONDS: %w", err)
 	}
+	if cooldownSeconds <= 0 {
+		return Config{}, fmt.Errorf("invalid TOKEN_COOLDOWN_SECONDS: must be greater than 0")
+	}
 
 	return Config{
 		GatewayAPIKey:        gatewayAPIKey,
