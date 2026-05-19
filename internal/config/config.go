@@ -15,6 +15,7 @@ type Config struct {
 	UpstreamBaseURL      *url.URL
 	Port                 string
 	TokenCooldownSeconds int
+	MaxRequestBodyBytes  int64
 }
 
 func Load() (Config, error) {
@@ -46,12 +47,21 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("invalid TOKEN_COOLDOWN_SECONDS: must be greater than 0")
 	}
 
+	maxRequestBodyMB, err := parseIntDefault("MAX_REQUEST_BODY_MB", 10)
+	if err != nil {
+		return Config{}, fmt.Errorf("invalid MAX_REQUEST_BODY_MB: %w", err)
+	}
+	if maxRequestBodyMB <= 0 {
+		return Config{}, fmt.Errorf("invalid MAX_REQUEST_BODY_MB: must be greater than 0")
+	}
+
 	return Config{
 		GatewayAPIKey:        gatewayAPIKey,
 		UpstreamTokens:       upstreamTokens,
 		UpstreamBaseURL:      baseURL,
 		Port:                 getenvDefault("PORT", "8080"),
 		TokenCooldownSeconds: cooldownSeconds,
+		MaxRequestBodyBytes:  int64(maxRequestBodyMB) * 1024 * 1024,
 	}, nil
 }
 

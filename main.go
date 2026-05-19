@@ -27,7 +27,7 @@ func main() {
 	}
 
 	tokenPool := pool.NewTokenPool(cfg.UpstreamTokens)
-	proxyHandler := proxy.NewHandler(cfg.UpstreamBaseURL, tokenPool, time.Duration(cfg.TokenCooldownSeconds)*time.Second)
+	proxyHandler := proxy.NewHandler(cfg.UpstreamBaseURL, tokenPool, time.Duration(cfg.TokenCooldownSeconds)*time.Second, cfg.MaxRequestBodyBytes)
 
 	srv := newHTTPServer(cfg, server.NewHandler(cfg.GatewayAPIKey, proxyHandler))
 

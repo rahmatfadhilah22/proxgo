@@ -86,7 +86,7 @@ func TestServeHTTPForwardsRequestAndOverridesAuthorization(t *testing.T) {
 	}
 
 	pool := &fakeTokenPool{tokens: []string{"token-a"}}
-	handler := NewHandler(baseURL, pool, time.Minute)
+	handler := NewHandler(baseURL, pool, time.Minute, 10*1024*1024)
 
 	req := httptest.NewRequest(http.MethodPost, "/chat/completions?stream=true", strings.NewReader(`{"model":"x"}`))
 	req.Header.Set("Authorization", "Bearer client-token")
@@ -149,7 +149,7 @@ func TestServeHTTPRetriesOn429AndMarksCooldown(t *testing.T) {
 	}
 
 	pool := &fakeTokenPool{tokens: []string{"token-a", "token-b"}}
-	handler := NewHandler(baseURL, pool, 2*time.Minute)
+	handler := NewHandler(baseURL, pool, 2*time.Minute, 10*1024*1024)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"input":"hi"}`))
 	rec := httptest.NewRecorder()
@@ -186,7 +186,7 @@ func TestServeHTTPRetriesOnceOnTransportError(t *testing.T) {
 	}
 
 	pool := &fakeTokenPool{tokens: []string{"token-a", "token-b"}}
-	handler := NewHandler(baseURL, pool, time.Minute)
+	handler := NewHandler(baseURL, pool, time.Minute, 10*1024*1024)
 
 	var mu sync.Mutex
 	seenTokens := []string{}
@@ -252,7 +252,7 @@ func TestServeHTTPRetriesOnceOnServerError(t *testing.T) {
 	}
 
 	pool := &fakeTokenPool{tokens: []string{"token-a", "token-b", "token-c"}}
-	handler := NewHandler(baseURL, pool, time.Minute)
+	handler := NewHandler(baseURL, pool, time.Minute, 10*1024*1024)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"x"}`))
 	rec := httptest.NewRecorder()
@@ -274,7 +274,7 @@ func TestServeHTTPReturns503WhenNoTokenAvailable(t *testing.T) {
 	}
 
 	pool := &fakeTokenPool{}
-	handler := NewHandler(baseURL, pool, time.Minute)
+	handler := NewHandler(baseURL, pool, time.Minute, 10*1024*1024)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"x"}`))
 	rec := httptest.NewRecorder()
@@ -296,9 +296,9 @@ func TestServeHTTPRejectsTooLargeRequestBody(t *testing.T) {
 	}
 
 	pool := &fakeTokenPool{tokens: []string{"token-a"}}
-	handler := NewHandler(baseURL, pool, time.Minute)
+	handler := NewHandler(baseURL, pool, time.Minute, 1024)
 
-	body := strings.Repeat("a", maxRequestBodyBytes+1)
+	body := strings.Repeat("a", 1025)
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 
@@ -312,13 +312,47 @@ func TestServeHTTPRejectsTooLargeRequestBody(t *testing.T) {
 	}
 }
 
+func TestServeHTTPAllowsRequestBodyUpToConfiguredLimit(t *testing.T) {
+	requests := make(chan struct{}, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	baseURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse base URL: %v", err)
+	}
+
+	bodyLimit := int64(2 * 1024 * 1024)
+	pool := &fakeTokenPool{tokens: []string{"token-a"}}
+	handler := NewHandler(baseURL, pool, time.Minute, bodyLimit)
+
+	body := strings.Repeat("a", int(bodyLimit))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+	select {
+	case <-requests:
+	default:
+		t.Fatal("expected request to reach upstream when body is at configured limit")
+	}
+}
+
 func TestNewHandlerUsesStreamingFriendlyHTTPClient(t *testing.T) {
 	baseURL, err := url.Parse("https://example.com/v1")
 	if err != nil {
 		t.Fatalf("parse base URL: %v", err)
 	}
 
-	handler := NewHandler(baseURL, &fakeTokenPool{tokens: []string{"token-a"}}, time.Minute)
+	handler := NewHandler(baseURL, &fakeTokenPool{tokens: []string{"token-a"}}, time.Minute, 10*1024*1024)
 
 	if handler.client.Timeout != 0 {
 		t.Fatalf("expected client timeout 0 for streaming safety, got %s", handler.client.Timeout)

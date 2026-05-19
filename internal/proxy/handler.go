@@ -17,7 +17,6 @@ import (
 	"proxgo/internal/pool"
 )
 
-const maxRequestBodyBytes = 1 << 20
 const upstreamBodyIdleTimeout = 2 * time.Minute
 
 type tokenPool interface {
@@ -31,14 +30,16 @@ type Handler struct {
 	baseURL          *url.URL
 	pool             tokenPool
 	cooldownDuration time.Duration
+	maxRequestBodyBytes int64
 }
 
-func NewHandler(baseURL *url.URL, tokenPool tokenPool, cooldownDuration time.Duration) *Handler {
+func NewHandler(baseURL *url.URL, tokenPool tokenPool, cooldownDuration time.Duration, maxRequestBodyBytes int64) *Handler {
 	return &Handler{
-		client:           newHTTPClient(),
-		baseURL:          cloneURL(baseURL),
-		pool:             tokenPool,
-		cooldownDuration: cooldownDuration,
+		client:              newHTTPClient(),
+		baseURL:             cloneURL(baseURL),
+		pool:                tokenPool,
+		cooldownDuration:    cooldownDuration,
+		maxRequestBodyBytes: maxRequestBodyBytes,
 	}
 }
 
@@ -57,12 +58,12 @@ func newHTTPClient() *http.Client {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes+1))
+	body, err := io.ReadAll(io.LimitReader(r.Body, h.maxRequestBodyBytes+1))
 	if err != nil {
 		httpjson.WriteError(w, http.StatusInternalServerError, "failed to read request body")
 		return
 	}
-	if len(body) > maxRequestBodyBytes {
+	if int64(len(body)) > h.maxRequestBodyBytes {
 		httpjson.WriteError(w, http.StatusRequestEntityTooLarge, "request body too large")
 		return
 	}
