@@ -88,7 +88,8 @@ docker compose up --build
 
 ## Batas Request
 
-- Body request dibatasi sampai `1 MiB`
+- Body request dibatasi sampai `10 MiB` secara default
+- Limit dapat diubah lewat environment variable `MAX_REQUEST_BODY_MB`
 - Jika melewati batas, gateway mengembalikan `413 {"error":"request body too large"}`
 
 ## Catatan
