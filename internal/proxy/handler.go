@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,6 +18,7 @@ import (
 )
 
 const maxRequestBodyBytes = 1 << 20
+const upstreamBodyIdleTimeout = 2 * time.Minute
 
 type tokenPool interface {
 	PickExcluding(excluded map[string]struct{}) (string, error)
@@ -33,11 +35,25 @@ type Handler struct {
 
 func NewHandler(baseURL *url.URL, tokenPool tokenPool, cooldownDuration time.Duration) *Handler {
 	return &Handler{
-		client:           &http.Client{Timeout: 60 * time.Second},
+		client:           newHTTPClient(),
 		baseURL:          cloneURL(baseURL),
 		pool:             tokenPool,
 		cooldownDuration: cooldownDuration,
 	}
+}
+
+func newHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	transport.TLSHandshakeTimeout = 10 * time.Second
+	transport.ResponseHeaderTimeout = 60 * time.Second
+	transport.ExpectContinueTimeout = 1 * time.Second
+	transport.IdleConnTimeout = 90 * time.Second
+
+	return &http.Client{Transport: transport}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -67,7 +83,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		usedTokens[token] = struct{}{}
 
-		resp, duration, err := h.forward(r, body, token)
+		resp, duration, cancel, err := h.forward(r, body, token)
 		if err != nil {
 			if !transportRetryUsed && shouldRetryTransportError(err) {
 				retryToken, retryErr := h.pool.PickExcluding(usedTokens)
@@ -75,7 +91,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					transportRetryUsed = true
 					usedTokens[retryToken] = struct{}{}
 
-					resp, duration, err = h.forward(r, body, retryToken)
+					resp, duration, cancel, err = h.forward(r, body, retryToken)
 					token = retryToken
 					if err == nil {
 						goto handleResponse
@@ -96,7 +112,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				usedTokens[retryToken] = struct{}{}
 				closeBody(resp.Body)
 
-				resp, duration, err = h.forward(r, body, retryToken)
+				cancel()
+				resp, duration, cancel, err = h.forward(r, body, retryToken)
 				token = retryToken
 				if err != nil {
 					httpjson.WriteError(w, http.StatusBadGateway, "upstream request failed")
@@ -108,17 +125,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		switch {
 		case resp.StatusCode == http.StatusTooManyRequests:
+			cancel()
 			h.pool.MarkCooldown(token, h.cooldownDuration)
 			log.Printf("[WARN] %s %s -> token=%s -> 429, marking cooldown %s", r.Method, r.URL.Path, tokenLabel(token), h.cooldownDuration)
 			closeBody(resp.Body)
 			continue
 		case isServerError(resp.StatusCode):
 			log.Printf("[WARN] %s %s -> token=%s -> upstream %d after %s", r.Method, r.URL.Path, tokenLabel(token), resp.StatusCode, duration)
-			writeUpstreamResponse(w, resp)
+			writeUpstreamResponse(w, resp, cancel)
 			return
 		default:
 			log.Printf("[INFO] %s %s -> token=%s -> %d (%s)", r.Method, r.URL.Path, tokenLabel(token), resp.StatusCode, duration)
-			writeUpstreamResponse(w, resp)
+			writeUpstreamResponse(w, resp, cancel)
 			return
 		}
 	}
@@ -127,11 +145,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[ERROR] %s %s -> all tokens rate limited", r.Method, r.URL.Path)
 }
 
-func (h *Handler) forward(r *http.Request, body []byte, token string) (*http.Response, time.Duration, error) {
+
+func (h *Handler) forward(r *http.Request, body []byte, token string) (*http.Response, time.Duration, context.CancelFunc, error) {
 	upstreamURL := h.buildUpstreamURL(r.URL)
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL.String(), bytes.NewReader(body))
+	ctx, cancel := context.WithCancel(r.Context())
+	req, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL.String(), bytes.NewReader(body))
 	if err != nil {
-		return nil, 0, err
+		cancel()
+		return nil, 0, nil, err
 	}
 
 	copyHeaders(req.Header, r.Header)
@@ -141,10 +162,11 @@ func (h *Handler) forward(r *http.Request, body []byte, token string) (*http.Res
 	start := time.Now()
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return nil, 0, err
+		cancel()
+		return nil, 0, nil, err
 	}
 
-	return resp, time.Since(start), nil
+	return resp, time.Since(start), cancel, nil
 }
 
 func (h *Handler) buildUpstreamURL(requestURL *url.URL) *url.URL {
@@ -188,8 +210,9 @@ func copyHeaders(dst, src http.Header) {
 	}
 }
 
-func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
+func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response, cancel context.CancelFunc) {
 	defer closeBody(resp.Body)
+	defer cancel()
 
 	for key, values := range resp.Header {
 		for _, value := range values {
@@ -198,7 +221,51 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
 	}
 
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	idleTimer := time.NewTimer(upstreamBodyIdleTimeout)
+	defer func() {
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+	}()
+	stopTimerWatcher := make(chan struct{})
+	defer close(stopTimerWatcher)
+	go func() {
+		select {
+		case <-idleTimer.C:
+			cancel()
+		case <-stopTimerWatcher:
+		}
+	}()
+
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			resetTimer(idleTimer, upstreamBodyIdleTimeout)
+			if _, err := w.Write(buf[:n]); err != nil {
+				log.Printf("[WARN] upstream response write interrupted: %v", err)
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+
+		if readErr == nil {
+			continue
+		}
+		if errors.Is(readErr, io.EOF) {
+			return
+		}
+
+		log.Printf("[WARN] upstream response read interrupted: %v", readErr)
+		return
+	}
 }
 
 func closeBody(closer io.Closer) {
@@ -218,6 +285,16 @@ func tokenLabel(token string) string {
 
 func shouldRetryTransportError(err error) bool {
 	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+}
+
+func resetTimer(timer *time.Timer, d time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(d)
 }
 
 var _ tokenPool = (*pool.TokenPool)(nil)

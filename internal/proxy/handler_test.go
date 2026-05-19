@@ -312,7 +312,7 @@ func TestServeHTTPRejectsTooLargeRequestBody(t *testing.T) {
 	}
 }
 
-func TestNewHandlerAppliesHTTPClientTimeout(t *testing.T) {
+func TestNewHandlerUsesStreamingFriendlyHTTPClient(t *testing.T) {
 	baseURL, err := url.Parse("https://example.com/v1")
 	if err != nil {
 		t.Fatalf("parse base URL: %v", err)
@@ -320,8 +320,22 @@ func TestNewHandlerAppliesHTTPClientTimeout(t *testing.T) {
 
 	handler := NewHandler(baseURL, &fakeTokenPool{tokens: []string{"token-a"}}, time.Minute)
 
-	if handler.client.Timeout != 60*time.Second {
-		t.Fatalf("expected client timeout 60s, got %s", handler.client.Timeout)
+	if handler.client.Timeout != 0 {
+		t.Fatalf("expected client timeout 0 for streaming safety, got %s", handler.client.Timeout)
+	}
+
+	transport, ok := handler.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected *http.Transport, got %T", handler.client.Transport)
+	}
+	if transport.ResponseHeaderTimeout <= 0 {
+		t.Fatal("expected ResponseHeaderTimeout to be set")
+	}
+	if transport.TLSHandshakeTimeout <= 0 {
+		t.Fatal("expected TLSHandshakeTimeout to be set")
+	}
+	if transport.IdleConnTimeout <= 0 {
+		t.Fatal("expected IdleConnTimeout to be set")
 	}
 }
 
